@@ -69,12 +69,24 @@ function sessionsFromScale(value: number) {
   return Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, Math.round(MIN_SESSIONS * Math.exp(logValue))))
 }
 
-function visibleSessionPresets(presets: number[], trackWidth: number) {
-  if (trackWidth <= 0) return presets
+type ScaleLayout = {
+  rowWidth: number
+  trackLeft: number
+  trackWidth: number
+  thumbWidth: number
+}
+
+function sliderThumbCenter(percent: number, layout: ScaleLayout) {
+  const travel = Math.max(0, layout.trackWidth - layout.thumbWidth)
+  return layout.trackLeft + layout.thumbWidth / 2 + percent * travel
+}
+
+function visibleSessionPresets(presets: number[], layout: ScaleLayout) {
+  if (layout.rowWidth <= 0 || layout.trackWidth <= 0) return presets
   const gap = 6
   const marks = presets.map((preset) => {
     const width = Math.max(28, String(preset).length * 7 + 10)
-    const center = sessionScale(preset) * trackWidth
+    const center = sliderThumbCenter(sessionScale(preset), layout)
     const left = center - width / 2
     return { preset, left, right: left + width }
   })
@@ -85,12 +97,12 @@ function visibleSessionPresets(presets: number[], trackWidth: number) {
     kept.push(mark)
   }
   const lastPreset = presets[presets.length - 1]
-  if (lastPreset != null && kept[kept.length - 1]?.preset !== lastPreset) {
-    const last = marks[marks.length - 1]
-    while (kept.length > 0 && last.left < kept[kept.length - 1].right + gap) {
+  const lastMark = marks[marks.length - 1]
+  if (lastPreset != null && lastMark && kept[kept.length - 1]?.preset !== lastPreset) {
+    while (kept.length > 0 && lastMark.left < kept[kept.length - 1].right + gap) {
       kept.pop()
     }
-    kept.push(last)
+    kept.push(lastMark)
   }
   return kept.map((mark) => mark.preset)
 }
@@ -278,14 +290,19 @@ function SetupView({
   const canStart = accountChoice?.kind === "cached" && ["idle", "failed"].includes(snapshot.phase)
   const preparing = !["idle", "failed"].includes(snapshot.phase)
   const setupRef = useRef<HTMLDivElement>(null)
-  const presetRowRef = useRef<HTMLDivElement>(null)
+  const scaleRef = useRef<HTMLDivElement>(null)
   const draggingDivider = useRef(false)
   const [accountPaneWidth, setAccountPaneWidth] = useState(323)
   const [dividerDragging, setDividerDragging] = useState(false)
-  const [presetTrackWidth, setPresetTrackWidth] = useState(0)
+  const [scaleLayout, setScaleLayout] = useState<ScaleLayout>({
+    rowWidth: 0,
+    trackLeft: 0,
+    trackWidth: 0,
+    thumbWidth: 9,
+  })
   const visiblePresets = useMemo(
-    () => visibleSessionPresets(SESSION_PRESETS, presetTrackWidth),
-    [presetTrackWidth],
+    () => visibleSessionPresets(SESSION_PRESETS, scaleLayout),
+    [scaleLayout],
   )
 
   useEffect(() => {
@@ -321,13 +338,25 @@ function SetupView({
   }, [])
 
   useEffect(() => {
-    const element = presetRowRef.current
-    if (!element) return
-    const observer = new ResizeObserver(([entry]) => {
-      setPresetTrackWidth(entry.contentRect.width)
-    })
-    observer.observe(element)
-    setPresetTrackWidth(element.getBoundingClientRect().width)
+    const root = scaleRef.current
+    if (!root) return
+    const update = () => {
+      const row = root.querySelector(".preset-row")
+      const track = root.querySelector("[data-slot='slider-track']")
+      const thumb = root.querySelector("[data-slot='slider-thumb']")
+      if (!row || !track) return
+      const rowBox = row.getBoundingClientRect()
+      const trackBox = track.getBoundingClientRect()
+      setScaleLayout({
+        rowWidth: rowBox.width,
+        trackLeft: trackBox.left - rowBox.left,
+        trackWidth: trackBox.width,
+        thumbWidth: thumb?.getBoundingClientRect()?.width || 9,
+      })
+    }
+    const observer = new ResizeObserver(update)
+    observer.observe(root)
+    update()
     return () => observer.disconnect()
   }, [])
 
@@ -394,7 +423,7 @@ function SetupView({
             />
           </label>
 
-          <div className="concurrency-control">
+          <div ref={scaleRef} className="concurrency-control">
             <div className="concurrency-header">
               <label htmlFor="session-count">并发</label>
               <div className="concurrency-value">
@@ -421,13 +450,13 @@ function SetupView({
               onValueChange={([value]) => onConfigurationChange({ ...configuration, sessions: sessionsFromScale(value) })}
               aria-label="并发数"
             />
-            <div ref={presetRowRef} className="preset-row" aria-label="常用并发数">
+            <div className="preset-row" aria-label="常用并发数">
               {visiblePresets.map((preset) => (
                 <Button
                   key={preset}
                   variant={configuration.sessions === preset ? "secondary" : "ghost"}
                   size="sm"
-                  style={{ left: `${sessionScale(preset) * 100}%` }}
+                  style={{ left: sliderThumbCenter(sessionScale(preset), scaleLayout) }}
                   onClick={() => onConfigurationChange({ ...configuration, sessions: preset })}
                 >
                   {preset}
