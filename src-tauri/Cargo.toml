@@ -1,6 +1,6 @@
 [package]
 name = "biliowdrops-tauri"
-version = "1.0.0"
+version = "1.0.1"
 description = "Bilibili 掉宝观看桌面工具"
 authors = ["JXZ"]
 edition = "2021"

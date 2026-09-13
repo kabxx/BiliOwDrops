@@ -558,6 +558,14 @@ function RunView({
             <span className="identity-label">房间号</span>
             <strong>{snapshot.identity?.roomId ?? "读取中"}</strong>
           </div>
+          <div className="identity-block">
+            <span className="identity-label">速度</span>
+            <strong>
+              {snapshot.diagnostics.rate == null
+                ? "--"
+                : `${snapshot.diagnostics.rate.toFixed(1)} / 分钟`}
+            </strong>
+          </div>
         </div>
         <div className={cn("run-state", `is-${snapshot.phase}`)}><i />{phaseLabel(snapshot.phase)}</div>
       </header>
@@ -606,14 +614,6 @@ function RunView({
             {activeProgress && <DropProgressRow progress={activeProgress} showName={false} />}
           </div>
         )}
-      </section>
-
-      <section className="session-line">
-        <div><span>会话</span><strong>{snapshot.sessions.established}<small>/ {snapshot.sessions.target}</small></strong></div>
-        <div><span>健康</span><strong>{snapshot.sessions.healthy}</strong></div>
-        <div><span>心跳</span><strong>{snapshot.sessions.heartbeats}</strong></div>
-        <div><span>速度</span><strong>{snapshot.diagnostics.rate == null ? "--" : snapshot.diagnostics.rate.toFixed(1)}{snapshot.diagnostics.rate != null && <small> / 分钟</small>}</strong></div>
-        <div><span>重连</span><strong>{snapshot.sessions.reconnects}</strong></div>
       </section>
 
       <footer className="run-actionbar">

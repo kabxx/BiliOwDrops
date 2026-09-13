@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -10,6 +13,8 @@ use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{BiliApi, LiveRoomInfo, SessionStats, TraceState, MAX_SESSIONS};
+
+const MAX_IN_FLIGHT_CONNECTS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct WatchManagerOptions {
@@ -145,6 +150,7 @@ impl RateLimitGate {
         }
     }
 
+    #[cfg(test)]
     fn is_current(&self, generation: u64) -> bool {
         let state = self.0.lock();
         state.generation == generation && state.until <= Instant::now()
@@ -159,6 +165,8 @@ pub struct WatchManager {
     connect_semaphore: Arc<Semaphore>,
     gate: RateLimitGate,
     heartbeat_pacer: RequestPacer,
+    room_entered: AtomicBool,
+    enter_lock: tokio::sync::Mutex<()>,
     state: Mutex<ManagerState>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -175,9 +183,11 @@ impl WatchManager {
             api,
             room,
             cancel: parent.child_token(),
-            connect_semaphore: Arc::new(Semaphore::new(usize::from(options.max_sessions))),
+            connect_semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTS)),
             gate: RateLimitGate::new(),
             heartbeat_pacer: RequestPacer::new(options.heartbeat_pace),
+            room_entered: AtomicBool::new(false),
+            enter_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(ManagerState::default()),
             tasks: Mutex::new(Vec::new()),
             options,
@@ -273,6 +283,8 @@ impl WatchManager {
         }
         let mut attempt = 0usize;
         while !self.cancel.is_cancelled() {
+            // Connecting/reconnecting sessions share the cool-down.
+            // Established heartbeats do not wait on this gate.
             if self.gate.wait_generation(&self.cancel).await.is_err() {
                 return;
             }
@@ -308,7 +320,7 @@ impl WatchManager {
                 if wait_duration(&self.cancel, interval).await.is_err() {
                     return;
                 }
-                if self.wait_request_slot(&self.heartbeat_pacer).await.is_err() {
+                if self.heartbeat_pacer.wait(&self.cancel).await.is_err() {
                     return;
                 }
                 match self.api.trace_heartbeat(&self.cancel, &trace).await {
@@ -340,18 +352,13 @@ impl WatchManager {
     }
 
     async fn establish(&self, page_uuid: &str) -> anyhow::Result<TraceState> {
+        self.ensure_room_entered().await?;
         let permit = tokio::select! {
             permit = Arc::clone(&self.connect_semaphore).acquire_owned() => {
                 permit.map_err(|_| anyhow!("建连调度器已关闭"))?
             }
             _ = self.cancel.cancelled() => return Err(anyhow!("操作已取消")),
         };
-        if let Err(error) = self.api.enter_room(&self.cancel, &self.room).await {
-            if is_rate_limit_error(&error) {
-                self.pause_for_rate_limit();
-            }
-            return Err(error);
-        }
         let result = self
             .api
             .trace_enter(&self.cancel, &self.room, page_uuid)
@@ -365,12 +372,28 @@ impl WatchManager {
         result
     }
 
-    async fn wait_request_slot(&self, pacer: &RequestPacer) -> anyhow::Result<()> {
-        loop {
-            let generation = self.gate.wait_generation(&self.cancel).await?;
-            pacer.wait(&self.cancel).await?;
-            if self.gate.is_current(generation) {
-                return Ok(());
+    async fn ensure_room_entered(&self) -> anyhow::Result<()> {
+        if self.room_entered.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _guard = tokio::select! {
+            guard = self.enter_lock.lock() => guard,
+            _ = self.cancel.cancelled() => return Err(anyhow!("操作已取消")),
+        };
+        if self.room_entered.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.gate.wait_generation(&self.cancel).await?;
+        match self.api.enter_room(&self.cancel, &self.room).await {
+            Ok(()) => {
+                self.room_entered.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                if is_rate_limit_error(&error) {
+                    self.pause_for_rate_limit();
+                }
+                Err(error)
             }
         }
     }
@@ -470,20 +493,28 @@ mod tests {
     use super::*;
 
     struct MockApi {
-        active: AtomicUsize,
-        max_active: AtomicUsize,
         enters: AtomicUsize,
+        traces: AtomicUsize,
         fail_first: AtomicUsize,
+        rate_limit_after_traces: usize,
+        heartbeat_interval: Duration,
     }
 
     impl MockApi {
         fn new(fail_first: usize) -> Self {
             Self {
-                active: AtomicUsize::new(0),
-                max_active: AtomicUsize::new(0),
                 enters: AtomicUsize::new(0),
+                traces: AtomicUsize::new(0),
                 fail_first: AtomicUsize::new(fail_first),
+                rate_limit_after_traces: usize::MAX,
+                heartbeat_interval: Duration::from_secs(60),
             }
+        }
+
+        fn rate_limited_after(mut self, traces: usize, heartbeat_interval: Duration) -> Self {
+            self.rate_limit_after_traces = traces;
+            self.heartbeat_interval = heartbeat_interval;
+            self
         }
     }
 
@@ -511,11 +542,9 @@ mod tests {
             cancel: &CancellationToken,
             _: &LiveRoomInfo,
         ) -> anyhow::Result<()> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(active, Ordering::SeqCst);
             self.enters.fetch_add(1, Ordering::SeqCst);
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(3)) => Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => Ok(()),
                 _ = cancel.cancelled() => Err(anyhow!("cancelled")),
             }
         }
@@ -525,7 +554,10 @@ mod tests {
             room: &LiveRoomInfo,
             page_uuid: &str,
         ) -> anyhow::Result<TraceState> {
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            let n = self.traces.fetch_add(1, Ordering::SeqCst);
+            if n >= self.rate_limit_after_traces {
+                return Err(anyhow!("-702 频繁"));
+            }
             if self
                 .fail_first
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -540,7 +572,7 @@ mod tests {
                 page_uuid: page_uuid.into(),
                 seq: 0,
                 timestamp: 0,
-                heartbeat_interval: Duration::from_secs(60),
+                heartbeat_interval: self.heartbeat_interval,
                 secret_key: "secret".into(),
                 secret_rule: vec![0],
             })
@@ -594,6 +626,8 @@ mod tests {
         .await
         .unwrap();
         manager.stop().await;
+        assert_eq!(api.enters.load(Ordering::SeqCst), 1);
+        assert_eq!(api.traces.load(Ordering::SeqCst), 50);
     }
 
     #[test]
@@ -611,7 +645,7 @@ mod tests {
         let manager = WatchManager::new(&cancel, api.clone(), room(), fast_options(4));
         manager.scale_to(4).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while api.enters.load(Ordering::SeqCst) < 6 {
+            while manager.stats().established < 4 {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
@@ -620,6 +654,8 @@ mod tests {
         manager.stop().await;
         assert!(manager.tasks.lock().is_empty());
         assert!(manager.stats().reconnects >= 2);
+        assert_eq!(api.enters.load(Ordering::SeqCst), 1);
+        assert!(api.traces.load(Ordering::SeqCst) >= 6);
     }
 
     #[tokio::test]
@@ -643,5 +679,35 @@ mod tests {
         pacer.wait(&cancel).await.unwrap();
         pacer.wait(&cancel).await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_heartbeats_continue_during_connect_rate_limit() {
+        let cancel = CancellationToken::new();
+        let api = Arc::new(
+            MockApi::new(0).rate_limited_after(1, Duration::from_millis(15)),
+        );
+        let options = WatchManagerOptions {
+            max_sessions: 3,
+            launch_delay_min: Duration::ZERO,
+            launch_delay_max: Duration::ZERO,
+            reconnect_delays: vec![Duration::from_millis(1)],
+            minimum_heartbeat_interval: Duration::from_millis(15),
+            rate_limit_pause: Duration::from_millis(400),
+            heartbeat_pace: Duration::from_millis(1),
+        };
+        let manager = WatchManager::new(&cancel, api.clone(), room(), options);
+        manager.scale_to(3).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while manager.stats().heartbeats < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("established session should keep heartbeating while others are rate-limited");
+        assert_eq!(manager.stats().established, 1);
+        assert!(manager.stats().rate_limits >= 1);
+        assert_eq!(api.enters.load(Ordering::SeqCst), 1);
+        manager.stop().await;
     }
 }
