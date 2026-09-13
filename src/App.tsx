@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIcon,
   GiftIcon,
@@ -52,15 +52,43 @@ import type {
 import { cn } from "@/lib/utils"
 import { toast } from "sonner"
 
-const MAX_SESSIONS = 1000
-const SESSION_PRESETS = [10, 50, 100, 200, 500, 1000]
+const MAX_SESSIONS = 10000
+const SESSION_PRESETS = [10, 100, 500, 2000, 10000]
+const SESSION_SCALE_POWER = 1.5
 
 function sessionScale(value: number) {
-  return Math.log(Math.max(1, Math.min(MAX_SESSIONS, value))) / Math.log(MAX_SESSIONS)
+  const clamped = Math.max(1, Math.min(MAX_SESSIONS, value))
+  return Math.pow(Math.log(clamped) / Math.log(MAX_SESSIONS), SESSION_SCALE_POWER)
 }
 
 function sessionsFromScale(value: number) {
-  return Math.max(1, Math.min(MAX_SESSIONS, Math.round(Math.exp(value * Math.log(MAX_SESSIONS)))))
+  const unit = Math.max(0, Math.min(1, value))
+  const logValue = Math.pow(unit, 1 / SESSION_SCALE_POWER) * Math.log(MAX_SESSIONS)
+  return Math.max(1, Math.min(MAX_SESSIONS, Math.round(Math.exp(logValue))))
+}
+
+function visibleSessionPresets(presets: number[], trackWidth: number) {
+  if (trackWidth <= 0) return presets
+  const gap = 6
+  const marks = presets.map((preset, index) => {
+    const width = Math.max(28, String(preset).length * 7 + 10)
+    const isLast = index === presets.length - 1
+    const center = sessionScale(preset) * trackWidth
+    const left = isLast ? trackWidth - width : Math.max(0, center - width / 2)
+    return { preset, left, right: left + width, isLast }
+  })
+  const kept: typeof marks = []
+  for (const mark of marks) {
+    const previous = kept[kept.length - 1]
+    if (previous && mark.left < previous.right + gap) {
+      if (!mark.isLast) continue
+      while (kept.length > 0 && mark.left < kept[kept.length - 1].right + gap) {
+        kept.pop()
+      }
+    }
+    kept.push(mark)
+  }
+  return kept.map((mark) => mark.preset)
 }
 
 function App() {
@@ -246,9 +274,15 @@ function SetupView({
   const canStart = accountChoice?.kind === "cached" && ["idle", "failed"].includes(snapshot.phase)
   const preparing = !["idle", "failed"].includes(snapshot.phase)
   const setupRef = useRef<HTMLDivElement>(null)
+  const presetRowRef = useRef<HTMLDivElement>(null)
   const draggingDivider = useRef(false)
   const [accountPaneWidth, setAccountPaneWidth] = useState(323)
   const [dividerDragging, setDividerDragging] = useState(false)
+  const [presetTrackWidth, setPresetTrackWidth] = useState(0)
+  const visiblePresets = useMemo(
+    () => visibleSessionPresets(SESSION_PRESETS, presetTrackWidth),
+    [presetTrackWidth],
+  )
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -279,6 +313,17 @@ function SetupView({
       setAccountPaneWidth((current) => Math.min(current, maxWidth))
     })
     observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const element = presetRowRef.current
+    if (!element) return
+    const observer = new ResizeObserver(([entry]) => {
+      setPresetTrackWidth(entry.contentRect.width)
+    })
+    observer.observe(element)
+    setPresetTrackWidth(element.getBoundingClientRect().width)
     return () => observer.disconnect()
   }, [])
 
@@ -372,8 +417,8 @@ function SetupView({
               onValueChange={([value]) => onConfigurationChange({ ...configuration, sessions: sessionsFromScale(value) })}
               aria-label="并发数"
             />
-            <div className="preset-row" aria-label="常用并发数">
-              {SESSION_PRESETS.map((preset) => (
+            <div ref={presetRowRef} className="preset-row" aria-label="常用并发数">
+              {visiblePresets.map((preset) => (
                 <Button
                   key={preset}
                   variant={configuration.sessions === preset ? "secondary" : "ghost"}
