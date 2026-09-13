@@ -52,41 +52,45 @@ import type {
 import { cn } from "@/lib/utils"
 import { toast } from "sonner"
 
+const MIN_SESSIONS = 10
 const MAX_SESSIONS = 10000
 const SESSION_PRESETS = [10, 100, 500, 2000, 10000]
 const SESSION_SCALE_POWER = 1.5
 
 function sessionScale(value: number) {
-  const clamped = Math.max(1, Math.min(MAX_SESSIONS, value))
-  return Math.pow(Math.log(clamped) / Math.log(MAX_SESSIONS), SESSION_SCALE_POWER)
+  const clamped = Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, value))
+  const unit = Math.log(clamped / MIN_SESSIONS) / Math.log(MAX_SESSIONS / MIN_SESSIONS)
+  return Math.pow(unit, SESSION_SCALE_POWER)
 }
 
 function sessionsFromScale(value: number) {
   const unit = Math.max(0, Math.min(1, value))
-  const logValue = Math.pow(unit, 1 / SESSION_SCALE_POWER) * Math.log(MAX_SESSIONS)
-  return Math.max(1, Math.min(MAX_SESSIONS, Math.round(Math.exp(logValue))))
+  const logValue = Math.pow(unit, 1 / SESSION_SCALE_POWER) * Math.log(MAX_SESSIONS / MIN_SESSIONS)
+  return Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, Math.round(MIN_SESSIONS * Math.exp(logValue))))
 }
 
 function visibleSessionPresets(presets: number[], trackWidth: number) {
   if (trackWidth <= 0) return presets
   const gap = 6
-  const marks = presets.map((preset, index) => {
+  const marks = presets.map((preset) => {
     const width = Math.max(28, String(preset).length * 7 + 10)
-    const isLast = index === presets.length - 1
     const center = sessionScale(preset) * trackWidth
-    const left = isLast ? trackWidth - width : Math.max(0, center - width / 2)
-    return { preset, left, right: left + width, isLast }
+    const left = center - width / 2
+    return { preset, left, right: left + width }
   })
   const kept: typeof marks = []
   for (const mark of marks) {
     const previous = kept[kept.length - 1]
-    if (previous && mark.left < previous.right + gap) {
-      if (!mark.isLast) continue
-      while (kept.length > 0 && mark.left < kept[kept.length - 1].right + gap) {
-        kept.pop()
-      }
-    }
+    if (previous && mark.left < previous.right + gap) continue
     kept.push(mark)
+  }
+  const lastPreset = presets[presets.length - 1]
+  if (lastPreset != null && kept[kept.length - 1]?.preset !== lastPreset) {
+    const last = marks[marks.length - 1]
+    while (kept.length > 0 && last.left < kept[kept.length - 1].right + gap) {
+      kept.pop()
+    }
+    kept.push(last)
   }
   return kept.map((mark) => mark.preset)
 }
@@ -397,11 +401,11 @@ function SetupView({
                 <Input
                   id="session-count"
                   type="number"
-                  min={1}
+                  min={MIN_SESSIONS}
                   max={MAX_SESSIONS}
                   value={configuration.sessions}
                   onChange={(event) => {
-                    const value = Math.max(1, Math.min(MAX_SESSIONS, Number(event.target.value) || 1))
+                    const value = Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, Number(event.target.value) || MIN_SESSIONS))
                     onConfigurationChange({ ...configuration, sessions: value })
                   }}
                   aria-label="并发数"

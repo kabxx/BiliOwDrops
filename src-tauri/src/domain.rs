@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_ROOM_ID: &str = "23612045";
+pub const MIN_SESSIONS: u16 = 10;
 pub const DEFAULT_SESSIONS: u16 = 500;
 pub const MAX_SESSIONS: u16 = 10000;
 
@@ -19,8 +20,8 @@ pub struct RunConfiguration {
 impl RunConfiguration {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            (1..=MAX_SESSIONS).contains(&self.sessions),
-            "并发数必须在 1..={MAX_SESSIONS} 之间"
+            (MIN_SESSIONS..=MAX_SESSIONS).contains(&self.sessions),
+            "并发数必须在 {MIN_SESSIONS}..={MAX_SESSIONS} 之间"
         );
         anyhow::ensure!(
             !self.room_id.trim().is_empty()
@@ -260,7 +261,7 @@ mod tests {
 
     #[test]
     fn configuration_rejects_out_of_range_sessions() {
-        for sessions in [0, 10001] {
+        for sessions in [0, 9, 10001] {
             assert!(RunConfiguration {
                 room_id: DEFAULT_ROOM_ID.into(),
                 sessions,

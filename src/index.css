@@ -618,6 +618,7 @@
 .preset-row {
   position: relative;
   height: 56px;
+  overflow: visible;
 }
 
 .preset-row button {
@@ -633,10 +634,6 @@
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 10px;
-}
-
-.preset-row button:last-child {
-  transform: translateX(-100%);
 }
 
 .preset-row button[data-variant="secondary"] {
