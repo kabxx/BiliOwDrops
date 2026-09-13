@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIcon,
   GiftIcon,
@@ -52,15 +52,59 @@ import type {
 import { cn } from "@/lib/utils"
 import { toast } from "sonner"
 
-const MAX_SESSIONS = 1000
-const SESSION_PRESETS = [10, 50, 100, 200, 500, 1000]
+const MIN_SESSIONS = 10
+const MAX_SESSIONS = 10000
+const SESSION_PRESETS = [10, 100, 500, 2000, 10000]
+const SESSION_SCALE_POWER = 1.5
 
 function sessionScale(value: number) {
-  return Math.log(Math.max(1, Math.min(MAX_SESSIONS, value))) / Math.log(MAX_SESSIONS)
+  const clamped = Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, value))
+  const unit = Math.log(clamped / MIN_SESSIONS) / Math.log(MAX_SESSIONS / MIN_SESSIONS)
+  return Math.pow(unit, SESSION_SCALE_POWER)
 }
 
 function sessionsFromScale(value: number) {
-  return Math.max(1, Math.min(MAX_SESSIONS, Math.round(Math.exp(value * Math.log(MAX_SESSIONS)))))
+  const unit = Math.max(0, Math.min(1, value))
+  const logValue = Math.pow(unit, 1 / SESSION_SCALE_POWER) * Math.log(MAX_SESSIONS / MIN_SESSIONS)
+  return Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, Math.round(MIN_SESSIONS * Math.exp(logValue))))
+}
+
+type ScaleLayout = {
+  rowWidth: number
+  trackLeft: number
+  trackWidth: number
+  thumbWidth: number
+}
+
+function sliderThumbCenter(percent: number, layout: ScaleLayout) {
+  const travel = Math.max(0, layout.trackWidth - layout.thumbWidth)
+  return layout.trackLeft + layout.thumbWidth / 2 + percent * travel
+}
+
+function visibleSessionPresets(presets: number[], layout: ScaleLayout) {
+  if (layout.rowWidth <= 0 || layout.trackWidth <= 0) return presets
+  const gap = 6
+  const marks = presets.map((preset) => {
+    const width = Math.max(28, String(preset).length * 7 + 10)
+    const center = sliderThumbCenter(sessionScale(preset), layout)
+    const left = center - width / 2
+    return { preset, left, right: left + width }
+  })
+  const kept: typeof marks = []
+  for (const mark of marks) {
+    const previous = kept[kept.length - 1]
+    if (previous && mark.left < previous.right + gap) continue
+    kept.push(mark)
+  }
+  const lastPreset = presets[presets.length - 1]
+  const lastMark = marks[marks.length - 1]
+  if (lastPreset != null && lastMark && kept[kept.length - 1]?.preset !== lastPreset) {
+    while (kept.length > 0 && lastMark.left < kept[kept.length - 1].right + gap) {
+      kept.pop()
+    }
+    kept.push(lastMark)
+  }
+  return kept.map((mark) => mark.preset)
 }
 
 function App() {
@@ -246,9 +290,20 @@ function SetupView({
   const canStart = accountChoice?.kind === "cached" && ["idle", "failed"].includes(snapshot.phase)
   const preparing = !["idle", "failed"].includes(snapshot.phase)
   const setupRef = useRef<HTMLDivElement>(null)
+  const scaleRef = useRef<HTMLDivElement>(null)
   const draggingDivider = useRef(false)
   const [accountPaneWidth, setAccountPaneWidth] = useState(323)
   const [dividerDragging, setDividerDragging] = useState(false)
+  const [scaleLayout, setScaleLayout] = useState<ScaleLayout>({
+    rowWidth: 0,
+    trackLeft: 0,
+    trackWidth: 0,
+    thumbWidth: 9,
+  })
+  const visiblePresets = useMemo(
+    () => visibleSessionPresets(SESSION_PRESETS, scaleLayout),
+    [scaleLayout],
+  )
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -279,6 +334,29 @@ function SetupView({
       setAccountPaneWidth((current) => Math.min(current, maxWidth))
     })
     observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const root = scaleRef.current
+    if (!root) return
+    const update = () => {
+      const row = root.querySelector(".preset-row")
+      const track = root.querySelector("[data-slot='slider-track']")
+      const thumb = root.querySelector("[data-slot='slider-thumb']")
+      if (!row || !track) return
+      const rowBox = row.getBoundingClientRect()
+      const trackBox = track.getBoundingClientRect()
+      setScaleLayout({
+        rowWidth: rowBox.width,
+        trackLeft: trackBox.left - rowBox.left,
+        trackWidth: trackBox.width,
+        thumbWidth: thumb?.getBoundingClientRect()?.width || 9,
+      })
+    }
+    const observer = new ResizeObserver(update)
+    observer.observe(root)
+    update()
     return () => observer.disconnect()
   }, [])
 
@@ -345,18 +423,18 @@ function SetupView({
             />
           </label>
 
-          <div className="concurrency-control">
+          <div ref={scaleRef} className="concurrency-control">
             <div className="concurrency-header">
               <label htmlFor="session-count">并发</label>
               <div className="concurrency-value">
                 <Input
                   id="session-count"
                   type="number"
-                  min={1}
+                  min={MIN_SESSIONS}
                   max={MAX_SESSIONS}
                   value={configuration.sessions}
                   onChange={(event) => {
-                    const value = Math.max(1, Math.min(MAX_SESSIONS, Number(event.target.value) || 1))
+                    const value = Math.max(MIN_SESSIONS, Math.min(MAX_SESSIONS, Number(event.target.value) || MIN_SESSIONS))
                     onConfigurationChange({ ...configuration, sessions: value })
                   }}
                   aria-label="并发数"
@@ -373,12 +451,12 @@ function SetupView({
               aria-label="并发数"
             />
             <div className="preset-row" aria-label="常用并发数">
-              {SESSION_PRESETS.map((preset) => (
+              {visiblePresets.map((preset) => (
                 <Button
                   key={preset}
                   variant={configuration.sessions === preset ? "secondary" : "ghost"}
                   size="sm"
-                  style={{ left: `${sessionScale(preset) * 100}%` }}
+                  style={{ left: sliderThumbCenter(sessionScale(preset), scaleLayout) }}
                   onClick={() => onConfigurationChange({ ...configuration, sessions: preset })}
                 >
                   {preset}
@@ -558,6 +636,14 @@ function RunView({
             <span className="identity-label">房间号</span>
             <strong>{snapshot.identity?.roomId ?? "读取中"}</strong>
           </div>
+          <div className="identity-block">
+            <span className="identity-label">速度</span>
+            <strong>
+              {snapshot.diagnostics.rate == null
+                ? "--"
+                : `${snapshot.diagnostics.rate.toFixed(1)} / 分钟`}
+            </strong>
+          </div>
         </div>
         <div className={cn("run-state", `is-${snapshot.phase}`)}><i />{phaseLabel(snapshot.phase)}</div>
       </header>
@@ -606,14 +692,6 @@ function RunView({
             {activeProgress && <DropProgressRow progress={activeProgress} showName={false} />}
           </div>
         )}
-      </section>
-
-      <section className="session-line">
-        <div><span>会话</span><strong>{snapshot.sessions.established}<small>/ {snapshot.sessions.target}</small></strong></div>
-        <div><span>健康</span><strong>{snapshot.sessions.healthy}</strong></div>
-        <div><span>心跳</span><strong>{snapshot.sessions.heartbeats}</strong></div>
-        <div><span>速度</span><strong>{snapshot.diagnostics.rate == null ? "--" : snapshot.diagnostics.rate.toFixed(1)}{snapshot.diagnostics.rate != null && <small> / 分钟</small>}</strong></div>
-        <div><span>重连</span><strong>{snapshot.sessions.reconnects}</strong></div>
       </section>
 
       <footer className="run-actionbar">

@@ -642,7 +642,7 @@ impl ProgressMonitor {
                     sampled_at,
                 });
             if let (Some(start), Some(now)) = (baseline.sampled_at, sampled_at) {
-                if now > start && item.current >= baseline.current {
+                if now > start && item.current > baseline.current {
                     total_rate += (item.current - baseline.current)
                         / (now - start).num_milliseconds() as f64
                         * 60_000.0;
@@ -686,4 +686,38 @@ fn live_room_url(room_id: &str) -> anyhow::Result<String> {
     let room_id = room_id.trim().parse::<u64>()?;
     anyhow::ensure!(room_id > 0, "直播间号必须大于 0");
     Ok(format!("https://live.bilibili.com/{room_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn task(current: f64, sampled_at: DateTime<Utc>) -> TaskProgress {
+        TaskProgress {
+            id: "t".into(),
+            task_key: "drop-1".into(),
+            name: "watch".into(),
+            current,
+            limit: 240.0,
+            raw_status: 0,
+            sampled_at: sampled_at.to_rfc3339(),
+            checkpoints: vec![],
+        }
+    }
+
+    #[test]
+    fn rate_stays_none_until_progress_increases() {
+        let mut monitor = ProgressMonitor::default();
+        let t0 = Utc::now();
+        assert_eq!(monitor.update(&[task(10.0, t0)]), None);
+        assert_eq!(
+            monitor.update(&[task(10.0, t0 + ChronoDuration::seconds(10))]),
+            None
+        );
+        let rate = monitor
+            .update(&[task(11.0, t0 + ChronoDuration::seconds(60))])
+            .unwrap();
+        assert!((rate - 1.0).abs() < 1e-6);
+    }
 }

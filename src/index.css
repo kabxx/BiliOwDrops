@@ -73,7 +73,7 @@
   body,
   #root {
     min-width: 720px;
-    min-height: 500px;
+    min-height: 422px;
     height: 100%;
     margin: 0;
     overflow: hidden;
@@ -284,16 +284,14 @@
 }
 
 .account-empty strong {
-  position: relative;
-  top: -20px;
   font-size: 15px;
 }
 
 .account-scroll {
   position: relative;
-  min-height: 274px;
-  flex: 0 0 274px;
-  height: 274px;
+  min-height: 196px;
+  flex: 0 0 196px;
+  height: 196px;
   overflow: visible;
 }
 
@@ -354,7 +352,7 @@
 
 .account-list {
   display: flex;
-  min-height: 274px;
+  min-height: 196px;
   flex-direction: column;
   gap: 6px;
   padding-right: 0;
@@ -580,7 +578,7 @@
 }
 
 .concurrency-value input {
-  width: 54px;
+  width: 68px;
   height: 32px;
   text-align: right;
 }
@@ -618,6 +616,7 @@
 .preset-row {
   position: relative;
   height: 56px;
+  overflow: visible;
 }
 
 .preset-row button {
@@ -633,10 +632,6 @@
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 10px;
-}
-
-.preset-row button:last-child {
-  transform: translateX(-100%);
 }
 
 .preset-row button[data-variant="secondary"] {
@@ -805,15 +800,13 @@
 
 .progress-empty {
   position: absolute;
-  top: 32px;
-  right: 0;
-  left: 0;
+  inset: 0;
   display: flex;
   width: 100%;
-  height: 96px;
   min-height: 0;
   align-items: center;
   justify-content: center;
+  transform: translateY(16px);
   color: var(--text-3);
   font-size: 13px;
 }
@@ -1059,42 +1052,6 @@
 .checkpoint-marker.is-claimable .checkpoint-label,
 .checkpoint-marker.is-claimable .checkpoint-label strong { color: var(--signal); }
 
-.session-line {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  align-items: center;
-  border-top: 1px solid #353a41;
-  border-bottom: 1px solid #353a41;
-  transform: translateY(-20px);
-}
-
-.session-line > div {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  align-items: center;
-  gap: 5px;
-  padding: 12px 8px;
-  margin: 0;
-}
-
-.session-line span {
-  color: var(--text-3);
-  font-size: 12px;
-}
-
-.session-line strong {
-  color: var(--text-1);
-  font-family: var(--font-mono);
-  font-size: 19px;
-  font-weight: 550;
-}
-
-.session-line small {
-  color: var(--text-3);
-  font-size: 12px;
-}
-
 .run-actionbar {
   display: flex;
   min-height: 42px;
@@ -1211,7 +1168,6 @@
   .settings-pane { padding-right: 36px; padding-left: 36px; }
   .account-time { display: none; }
   .run-screen { padding-right: 36px; padding-bottom: 24px; padding-left: 34px; }
-  .session-line > div { min-width: 0; margin: 0; padding: 12px 4px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
