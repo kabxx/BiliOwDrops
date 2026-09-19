@@ -710,7 +710,10 @@
 .identity-block:nth-child(n + 2) strong {
   font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 500;
+}
+
+.identity-block:nth-child(n + 2) strong.is-pending {
+  font-family: var(--font-sans);
 }
 
 .run-state {

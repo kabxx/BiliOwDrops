@@ -630,11 +630,11 @@ function RunView({
           </div>
           <div className="identity-block">
             <span className="identity-label">UID</span>
-            <strong>{snapshot.identity?.uid ?? "读取中"}</strong>
+            <strong className={!snapshot.identity?.uid ? "is-pending" : undefined}>{snapshot.identity?.uid ?? "读取中"}</strong>
           </div>
           <div className="identity-block">
             <span className="identity-label">房间号</span>
-            <strong>{snapshot.identity?.roomId ?? "读取中"}</strong>
+            <strong className={!snapshot.identity?.roomId ? "is-pending" : undefined}>{snapshot.identity?.roomId ?? "读取中"}</strong>
           </div>
           <div className="identity-block">
             <span className="identity-label">速度</span>
