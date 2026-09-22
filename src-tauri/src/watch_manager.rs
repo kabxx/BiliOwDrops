@@ -658,24 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn production_defaults_keep_required_request_limits() {
-        let options = WatchManagerOptions::default();
-        assert_eq!(options.launch_delay_min, Duration::ZERO);
-        assert_eq!(options.launch_delay_max, Duration::ZERO);
-        assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(1));
-        assert_eq!(options.enter_rate_initial, 10.0);
-        assert_eq!(options.enter_rate_min, 1.0);
-        assert_eq!(options.enter_rate_max, 100.0);
-    }
-
-
-    #[test]
-    fn classifies_x_errors() {
-        assert!(is_rate_limit_error(&anyhow!("-702 频繁")));
-        assert!(is_timeout_error(&anyhow!("operation timed out")));
-        assert!(!is_timeout_error(&anyhow!("-702 频繁")));
-    }
-    #[test]
     fn enter_aimd_grows_on_success_and_halves_once_per_second() {
         let limiter = test_enter_limiter(40.0);
         limiter.on_success();

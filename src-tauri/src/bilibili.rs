@@ -1344,13 +1344,6 @@ fn is_wbi_signature_error(value: &Value) -> bool {
         || message.contains("signature")
         || message.contains("签名")
 }
-pub fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("-702")
-        || message.contains("-509")
-        || message.contains("HTTP 429")
-        || message.contains('频')
-}
 
 pub fn is_authentication_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
