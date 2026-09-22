@@ -30,28 +30,6 @@ const SNAPSHOT_EVENT: &str = "app-snapshot";
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(3);
 const DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 
-async fn load_drop_progress(
-    client: &BiliClient,
-    cancel: &CancellationToken,
-    room_id: u64,
-    task_ids: &mut Vec<String>,
-) -> anyhow::Result<(Vec<String>, Vec<TaskProgress>)> {
-    if !task_ids.is_empty() {
-        match crate::domain::BiliApi::task_progress(client, cancel, task_ids).await {
-            Ok(progress) if !progress.is_empty() => {
-                return Ok((task_ids.clone(), progress));
-            }
-            Ok(_) | Err(_) => {}
-        }
-    }
-    *task_ids = client.discover_task_ids(cancel, room_id).await?;
-    if task_ids.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let progress = crate::domain::BiliApi::task_progress(client, cancel, task_ids).await?;
-    Ok((task_ids.clone(), progress))
-}
-
 struct ActiveRun {
     cancel: CancellationToken,
     task: JoinHandle<anyhow::Result<()>>,
@@ -495,7 +473,13 @@ impl AppController {
                     let current = if task_ids.is_empty() {
                         Ok((Vec::new(), Vec::new()))
                     } else {
-                        load_drop_progress(client.as_ref(), &cancel, room.room_id, &mut task_ids).await
+                        crate::domain::BiliApi::task_progress(
+                            client.as_ref(),
+                            &cancel,
+                            &task_ids,
+                        )
+                        .await
+                        .map(|progress| (task_ids.clone(), progress))
                     };
 
                     match current {
