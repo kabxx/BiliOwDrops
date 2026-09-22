@@ -10,8 +10,8 @@ use crate::domain::{BiliApi, CheckpointState, TaskCheckpoint, TaskProgress};
 
 pub const MINIMUM_CHECKPOINT_STABLE_POLLS: u32 = 5;
 pub const CONFIRMATION_POLLS: u32 = 2;
-pub const CLAIM_RETRY_COOLDOWN: Duration = Duration::from_secs(120);
-pub const CLAIM_SPACING: Duration = Duration::from_millis(1200);
+pub const CLAIM_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+pub const CLAIM_SPACING: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct RewardTracker {
@@ -154,16 +154,15 @@ impl RewardTracker {
             wait_cancel(cancel, CLAIM_SPACING.saturating_sub(last_claim.elapsed())).await?;
         }
         self.last_attempt.insert(point.id.clone(), Instant::now());
-        api.claim_reward(cancel, &point.id).await.map_err(|error| {
-            if error.to_string() == "操作已取消" {
-                error
-            } else {
-                anyhow!("领取奖励 {} 失败：{error}", point.id)
+        match api.claim_reward(cancel, &point.id).await {
+            Ok(()) => {
+                self.claim_submitted.insert(point.id.clone());
+                self.last_claim_at = Some(Instant::now());
+                Ok(())
             }
-        })?;
-        self.claim_submitted.insert(point.id.clone());
-        self.last_claim_at = Some(Instant::now());
-        Ok(())
+            Err(error) if error.to_string() == "操作已取消" => Err(error),
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -370,17 +369,17 @@ mod tests {
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
-    async fn failed_claim_respects_two_minute_cooldown() {
+    async fn failed_claim_respects_one_minute_cooldown() {
         let api = Arc::new(FailingClaimApi {
             calls: AtomicUsize::new(0),
         });
         let cancel = CancellationToken::new();
         let mut tracker = RewardTracker::new(["parent".into()]);
         let claimable = task(1.0, 10.0, vec![point("a", 10.0, 2)]);
-        assert!(tracker
+        assert!(!tracker
             .process(&cancel, api.as_ref(), std::slice::from_ref(&claimable))
             .await
-            .is_err());
+            .unwrap());
         assert!(!tracker
             .process(&cancel, api.as_ref(), &[claimable])
             .await

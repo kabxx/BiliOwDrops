@@ -935,40 +935,18 @@ impl BiliApi for BiliClient {
         cancel: &CancellationToken,
         checkpoint_id: &str,
     ) -> anyhow::Result<()> {
-        let delays = [
-            Duration::ZERO,
-            Duration::from_millis(1_500),
-            Duration::from_secs(3),
-        ];
-        let mut last_error = None;
-        for (attempt, delay) in delays.into_iter().enumerate() {
-            if !delay.is_zero() {
-                tokio::select! { _ = cancel.cancelled() => bail!("操作已取消"), _ = tokio::time::sleep(delay) => {} }
-            }
-            match self.reward_info(cancel, checkpoint_id).await {
-                Ok(info) => {
-                    if is_reward_settled_status(info.status) {
-                        return Ok(());
-                    }
-                    if info.status != 0 {
-                        bail!(
-                            "奖励 {checkpoint_id} 当前不可领取 status={} message={}",
-                            info.status,
-                            info.message
-                        );
-                    }
-                    return self.receive_reward(cancel, &info).await;
-                }
-                Err(error) => {
-                    let retry = is_rate_limit_error(&error) && attempt + 1 < delays.len();
-                    last_error = Some(error);
-                    if !retry {
-                        break;
-                    }
-                }
-            }
+        let info = self.reward_info(cancel, checkpoint_id).await?;
+        if is_reward_settled_status(info.status) {
+            return Ok(());
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("claim reward failed")))
+        if info.status != 0 {
+            bail!(
+                "奖励 {checkpoint_id} 当前不可领取 status={} message={}",
+                info.status,
+                info.message
+            );
+        }
+        self.receive_reward(cancel, &info).await
     }
 }
 
