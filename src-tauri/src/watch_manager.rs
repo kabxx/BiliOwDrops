@@ -43,7 +43,7 @@ impl Default for WatchManagerOptions {
                 Duration::from_secs(16),
                 Duration::from_secs(30),
             ],
-            minimum_heartbeat_interval: Duration::from_secs(5),
+            minimum_heartbeat_interval: Duration::from_secs(1),
             enter_rate_initial: ENTER_RATE_INITIAL,
             enter_rate_min: ENTER_RATE_MIN,
             enter_rate_max: ENTER_RATE_MAX,
@@ -63,7 +63,7 @@ impl WatchManagerOptions {
             self.reconnect_delays = WatchManagerOptions::default().reconnect_delays;
         }
         if self.minimum_heartbeat_interval.is_zero() {
-            self.minimum_heartbeat_interval = Duration::from_secs(5);
+            self.minimum_heartbeat_interval = Duration::from_secs(1);
         }
         if self.enter_rate_min <= 0.0 {
             self.enter_rate_min = ENTER_RATE_MIN;
@@ -675,7 +675,7 @@ mod tests {
         let options = WatchManagerOptions::default();
         assert_eq!(options.launch_delay_min, Duration::ZERO);
         assert_eq!(options.launch_delay_max, Duration::ZERO);
-        assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(1));
         assert_eq!(options.enter_rate_initial, 10.0);
         assert_eq!(options.enter_rate_min, 1.0);
         assert_eq!(options.enter_rate_max, 100.0);
