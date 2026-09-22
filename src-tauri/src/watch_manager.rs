@@ -23,7 +23,6 @@ pub struct WatchManagerOptions {
     pub max_sessions: u16,
     pub launch_delay_min: Duration,
     pub launch_delay_max: Duration,
-    pub reconnect_delays: Vec<Duration>,
     pub minimum_heartbeat_interval: Duration,
     pub enter_rate_initial: f64,
     pub enter_rate_min: f64,
@@ -36,13 +35,6 @@ impl Default for WatchManagerOptions {
             max_sessions: 50,
             launch_delay_min: Duration::ZERO,
             launch_delay_max: Duration::ZERO,
-            reconnect_delays: vec![
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-                Duration::from_secs(8),
-                Duration::from_secs(16),
-                Duration::from_secs(30),
-            ],
             minimum_heartbeat_interval: Duration::from_secs(1),
             enter_rate_initial: ENTER_RATE_INITIAL,
             enter_rate_min: ENTER_RATE_MIN,
@@ -58,9 +50,6 @@ impl WatchManagerOptions {
         }
         if self.launch_delay_max < self.launch_delay_min {
             self.launch_delay_max = self.launch_delay_min;
-        }
-        if self.reconnect_delays.is_empty() {
-            self.reconnect_delays = WatchManagerOptions::default().reconnect_delays;
         }
         if self.minimum_heartbeat_interval.is_zero() {
             self.minimum_heartbeat_interval = Duration::from_secs(1);
@@ -175,6 +164,13 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
         || message.contains("http 429")
         || message.contains("频率")
         || message.contains("频繁")
+}
+
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("timedout")
 }
 
 pub struct WatchManager {
@@ -298,7 +294,6 @@ impl WatchManager {
         {
             return;
         }
-        let mut attempt = 0usize;
         while !self.cancel.is_cancelled() {
             let page_uuid = {
                 let state = self.state.lock();
@@ -314,13 +309,6 @@ impl WatchManager {
                         return;
                     }
                     self.record_failure(id, &error, true);
-                    if wait_duration(&self.cancel, self.reconnect_delay(attempt))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    attempt = attempt.saturating_add(1);
                     continue;
                 }
             };
@@ -330,7 +318,7 @@ impl WatchManager {
                 + trace
                     .heartbeat_interval
                     .max(self.options.minimum_heartbeat_interval);
-            while !self.cancel.is_cancelled() {
+            'heartbeat: while !self.cancel.is_cancelled() {
                 let interval = trace
                     .heartbeat_interval
                     .max(self.options.minimum_heartbeat_interval);
@@ -344,29 +332,37 @@ impl WatchManager {
                 if wait_until(&self.cancel, due).await.is_err() {
                     return;
                 }
-                match self.api.trace_heartbeat(&self.cancel, &trace).await {
-                    Ok(next) => {
-                        trace = next;
-                        attempt = 0;
-                        not_before = due + interval;
-                        self.record_heartbeat(id);
-                    }
-                    Err(error) => {
-                        if self.cancel.is_cancelled() {
-                            return;
+                let mut timeout_retries = 0u8;
+                loop {
+                    match self.api.trace_heartbeat(&self.cancel, &trace).await {
+                        Ok(next) => {
+                            trace = next;
+                            not_before = due + interval;
+                            self.record_heartbeat(id);
+                            break;
                         }
-                        self.record_failure(id, &error, true);
-                        break;
+                        Err(error) => {
+                            if self.cancel.is_cancelled() {
+                                return;
+                            }
+                            if is_rate_limit_error(&error) {
+                                not_before = Instant::now();
+                                break;
+                            }
+                            if is_timeout_error(&error) && timeout_retries == 0 {
+                                timeout_retries = 1;
+                                continue;
+                            }
+                            if is_timeout_error(&error) {
+                                not_before = Instant::now();
+                                break;
+                            }
+                            self.record_failure(id, &error, true);
+                            break 'heartbeat;
+                        }
                     }
                 }
             }
-            if wait_duration(&self.cancel, self.reconnect_delay(attempt))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -421,14 +417,6 @@ impl WatchManager {
         random_duration(self.options.launch_delay_min, self.options.launch_delay_max)
     }
 
-    fn reconnect_delay(&self, attempt: usize) -> Duration {
-        let index = attempt.min(self.options.reconnect_delays.len() - 1);
-        let base = self.options.reconnect_delays[index];
-        let jitter_millis = (base.as_millis() as u64).saturating_mul(20) / 100;
-        let low = base.saturating_sub(Duration::from_millis(jitter_millis));
-        let high = base.saturating_add(Duration::from_millis(jitter_millis));
-        random_duration(low, high)
-    }
 }
 
 fn random_duration(low: Duration, high: Duration) -> Duration {
@@ -633,7 +621,6 @@ mod tests {
             max_sessions,
             launch_delay_min: Duration::ZERO,
             launch_delay_max: Duration::ZERO,
-            reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_secs(30),
             enter_rate_initial: 10_000.0,
             enter_rate_min: 1.0,
@@ -681,6 +668,13 @@ mod tests {
         assert_eq!(options.enter_rate_max, 100.0);
     }
 
+
+    #[test]
+    fn classifies_x_errors() {
+        assert!(is_rate_limit_error(&anyhow!("-702 频繁")));
+        assert!(is_timeout_error(&anyhow!("operation timed out")));
+        assert!(!is_timeout_error(&anyhow!("-702 频繁")));
+    }
     #[test]
     fn enter_aimd_grows_on_success_and_halves_once_per_second() {
         let limiter = test_enter_limiter(40.0);
@@ -786,7 +780,6 @@ mod tests {
             max_sessions: 3,
             launch_delay_min: Duration::ZERO,
             launch_delay_max: Duration::ZERO,
-            reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_millis(15),
             ..WatchManagerOptions::default()
         };
