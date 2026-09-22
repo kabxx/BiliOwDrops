@@ -27,7 +27,30 @@ use crate::{
 };
 
 const SNAPSHOT_EVENT: &str = "app-snapshot";
-const TASK_INTERVAL: Duration = Duration::from_secs(10);
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(3);
+const DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
+
+async fn load_drop_progress(
+    client: &BiliClient,
+    cancel: &CancellationToken,
+    room_id: u64,
+    task_ids: &mut Vec<String>,
+) -> anyhow::Result<(Vec<String>, Vec<TaskProgress>)> {
+    if !task_ids.is_empty() {
+        match crate::domain::BiliApi::task_progress(client, cancel, task_ids).await {
+            Ok(progress) if !progress.is_empty() => {
+                return Ok((task_ids.clone(), progress));
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    *task_ids = client.discover_task_ids(cancel, room_id).await?;
+    if task_ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let progress = crate::domain::BiliApi::task_progress(client, cancel, task_ids).await?;
+    Ok((task_ids.clone(), progress))
+}
 
 struct ActiveRun {
     cancel: CancellationToken,
@@ -416,7 +439,13 @@ impl AppController {
             snapshot.phase_message = "读取中".into();
         });
         let mut stats_tick = tokio::time::interval(Duration::from_millis(250));
-        let mut task_tick = tokio::time::interval(TASK_INTERVAL);
+        let mut progress_tick = tokio::time::interval(PROGRESS_INTERVAL);
+        let mut discover_tick = tokio::time::interval(DISCOVER_INTERVAL);
+        discover_tick.tick().await;
+        let mut task_ids = client
+            .discover_task_ids(&cancel, room.room_id)
+            .await
+            .unwrap_or_default();
         let result = loop {
             tokio::select! {
                 _ = cancel.cancelled() => break Ok(()),
@@ -432,24 +461,46 @@ impl AppController {
                         });
                     }
                 }
-                _ = task_tick.tick() => {
-                    let current: anyhow::Result<(Vec<String>, Vec<TaskProgress>)> = async {
-                        let task_ids = client.discover_task_ids(&cancel, room.room_id).await?;
-                        let progress = if task_ids.is_empty() {
-                            Vec::new()
-                        } else {
-                            crate::domain::BiliApi::task_progress(
-                                client.as_ref(),
-                                &cancel,
-                                &task_ids,
-                            ).await?
-                        };
-                        Ok((task_ids, progress))
-                    }.await;
+                _ = discover_tick.tick() => {
+                    match client.discover_task_ids(&cancel, room.room_id).await {
+                        Ok(ids) => {
+                            task_ids = ids;
+                            discovery.task_ids = task_ids.clone();
+                            if task_ids.is_empty() {
+                                if let Some(active_manager) = manager.take() {
+                                    active_manager.stop().await;
+                                }
+                                tracker = None;
+                                self.update(|snapshot| {
+                                    snapshot.phase = AppPhase::IdleDrops;
+                                    snapshot.phase_message = "空闲中".into();
+                                    snapshot.progress.clear();
+                                    snapshot.sessions = SessionStats {
+                                        target: sessions,
+                                        ..Default::default()
+                                    };
+                                    snapshot.diagnostics.rate = None;
+                                    snapshot.diagnostics.updated_at = None;
+                                    snapshot.diagnostics.errors.clear();
+                                });
+                            } else if task_ids != active_task_ids {
+                                active_task_ids = task_ids.clone();
+                                tracker = Some(RewardTracker::new(active_task_ids.clone()));
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                _ = progress_tick.tick() => {
+                    let current = if task_ids.is_empty() {
+                        Ok((Vec::new(), Vec::new()))
+                    } else {
+                        load_drop_progress(client.as_ref(), &cancel, room.room_id, &mut task_ids).await
+                    };
 
                     match current {
-                        Ok((task_ids, progress)) if progress.is_empty() => {
-                            discovery.task_ids = task_ids;
+                        Ok((ids, progress)) if progress.is_empty() => {
+                            discovery.task_ids = ids;
                             if let Some(active_manager) = manager.take() {
                                 active_manager.stop().await;
                             }
@@ -467,8 +518,8 @@ impl AppController {
                                 snapshot.diagnostics.errors.clear();
                             });
                         }
-                        Ok((task_ids, progress)) => {
-                            discovery.task_ids = task_ids;
+                        Ok((ids, progress)) => {
+                            discovery.task_ids = ids;
                             if discovery.task_ids != active_task_ids {
                                 active_task_ids = discovery.task_ids.clone();
                                 tracker = Some(RewardTracker::new(active_task_ids.clone()));
