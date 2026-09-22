@@ -23,7 +23,6 @@ pub struct WatchManagerOptions {
     pub launch_delay_max: Duration,
     pub reconnect_delays: Vec<Duration>,
     pub minimum_heartbeat_interval: Duration,
-    pub rate_limit_pause: Duration,
 }
 
 impl Default for WatchManagerOptions {
@@ -40,7 +39,6 @@ impl Default for WatchManagerOptions {
                 Duration::from_secs(30),
             ],
             minimum_heartbeat_interval: Duration::from_secs(5),
-            rate_limit_pause: Duration::from_secs(30),
         }
     }
 }
@@ -58,9 +56,6 @@ impl WatchManagerOptions {
         }
         if self.minimum_heartbeat_interval.is_zero() {
             self.minimum_heartbeat_interval = Duration::from_secs(5);
-        }
-        if self.rate_limit_pause.is_zero() {
-            self.rate_limit_pause = Duration::from_secs(30);
         }
         self
     }
@@ -80,50 +75,6 @@ struct SessionRuntime {
 struct ManagerState {
     target: u16,
     sessions: BTreeMap<u16, SessionRuntime>,
-    rate_limits: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GateState {
-    until: Instant,
-    generation: u64,
-}
-
-#[derive(Debug)]
-struct RateLimitGate(Mutex<GateState>);
-
-impl RateLimitGate {
-    fn new() -> Self {
-        Self(Mutex::new(GateState {
-            until: Instant::now(),
-            generation: 0,
-        }))
-    }
-
-    fn pause(&self, duration: Duration) {
-        let mut state = self.0.lock();
-        let until = Instant::now() + duration;
-        if until > state.until {
-            state.until = until;
-            state.generation = state.generation.wrapping_add(1);
-        }
-    }
-
-    async fn wait_generation(&self, cancel: &CancellationToken) -> anyhow::Result<u64> {
-        loop {
-            let state = *self.0.lock();
-            if state.until <= Instant::now() {
-                return Ok(state.generation);
-            }
-            wait_until(cancel, state.until).await?;
-        }
-    }
-
-    #[cfg(test)]
-    fn is_current(&self, generation: u64) -> bool {
-        let state = self.0.lock();
-        state.generation == generation && state.until <= Instant::now()
-    }
 }
 
 pub struct WatchManager {
@@ -132,7 +83,6 @@ pub struct WatchManager {
     options: WatchManagerOptions,
     cancel: CancellationToken,
     connect_semaphore: Arc<Semaphore>,
-    gate: RateLimitGate,
     epoch: Instant,
     room_entered: AtomicBool,
     enter_lock: tokio::sync::Mutex<()>,
@@ -153,7 +103,6 @@ impl WatchManager {
             room,
             cancel: parent.child_token(),
             connect_semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTS)),
-            gate: RateLimitGate::new(),
             epoch: Instant::now(),
             room_entered: AtomicBool::new(false),
             enter_lock: tokio::sync::Mutex::new(()),
@@ -208,7 +157,6 @@ impl WatchManager {
         let mut stats = SessionStats {
             target: state.target,
             registered: state.sessions.len().try_into().unwrap_or(u16::MAX),
-            rate_limits: state.rate_limits,
             ..SessionStats::default()
         };
         let mut errors = HashMap::<String, usize>::new();
@@ -252,11 +200,6 @@ impl WatchManager {
         }
         let mut attempt = 0usize;
         while !self.cancel.is_cancelled() {
-            // Connecting/reconnecting sessions share the cool-down.
-            // Established heartbeats do not wait on this gate.
-            if self.gate.wait_generation(&self.cancel).await.is_err() {
-                return;
-            }
             let page_uuid = {
                 let state = self.state.lock();
                 match state.sessions.get(&id) {
@@ -313,9 +256,6 @@ impl WatchManager {
                             return;
                         }
                         self.record_failure(id, &error, true);
-                        if is_rate_limit_error(&error) {
-                            self.pause_for_rate_limit();
-                        }
                         break;
                     }
                 }
@@ -343,11 +283,6 @@ impl WatchManager {
             .trace_enter(&self.cancel, &self.room, page_uuid)
             .await;
         drop(permit);
-        if let Err(error) = &result {
-            if is_rate_limit_error(error) {
-                self.pause_for_rate_limit();
-            }
-        }
         result
     }
 
@@ -362,24 +297,9 @@ impl WatchManager {
         if self.room_entered.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.gate.wait_generation(&self.cancel).await?;
-        match self.api.enter_room(&self.cancel, &self.room).await {
-            Ok(()) => {
-                self.room_entered.store(true, Ordering::Release);
-                Ok(())
-            }
-            Err(error) => {
-                if is_rate_limit_error(&error) {
-                    self.pause_for_rate_limit();
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn pause_for_rate_limit(&self) {
-        self.state.lock().rate_limits += 1;
-        self.gate.pause(self.options.rate_limit_pause);
+        self.api.enter_room(&self.cancel, &self.room).await?;
+        self.room_entered.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn set_established(&self, id: u16) {
@@ -501,15 +421,6 @@ fn new_page_uuid() -> String {
         chrono::Utc::now().timestamp(),
         uuid::Uuid::new_v4()
     )
-}
-
-pub fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_lowercase();
-    message.contains("-702")
-        || message.contains("-509")
-        || message.contains("http 429")
-        || message.contains("频率")
-        || message.contains("频繁")
 }
 
 #[cfg(test)]
@@ -637,7 +548,6 @@ mod tests {
             launch_delay_max: Duration::ZERO,
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_secs(30),
-            rate_limit_pause: Duration::from_millis(8),
         }
     }
 
@@ -666,7 +576,6 @@ mod tests {
         assert_eq!(options.launch_delay_min, Duration::ZERO);
         assert_eq!(options.launch_delay_max, Duration::ZERO);
         assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(5));
-        assert_eq!(options.rate_limit_pause, Duration::from_secs(30));
     }
 
     #[test]
@@ -739,17 +648,6 @@ mod tests {
         assert!(api.traces.load(Ordering::SeqCst) >= 6);
     }
 
-    #[tokio::test]
-    async fn gate_generation_forces_queued_request_to_wait_again() {
-        let gate = Arc::new(RateLimitGate::new());
-        let cancel = CancellationToken::new();
-        let initial = gate.wait_generation(&cancel).await.unwrap();
-        gate.pause(Duration::from_millis(12));
-        assert!(!gate.is_current(initial));
-        let next = gate.wait_generation(&cancel).await.unwrap();
-        assert!(next > initial);
-        assert!(gate.is_current(next));
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_heartbeats_continue_during_connect_rate_limit() {
@@ -763,7 +661,6 @@ mod tests {
             launch_delay_max: Duration::ZERO,
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_millis(15),
-            rate_limit_pause: Duration::from_millis(400),
         };
         let manager = WatchManager::new(&cancel, api.clone(), room(), options);
         manager.scale_to(3).unwrap();
@@ -775,7 +672,6 @@ mod tests {
         .await
         .expect("established session should keep heartbeating while others are rate-limited");
         assert_eq!(manager.stats().established, 1);
-        assert!(manager.stats().rate_limits >= 1);
         assert_eq!(api.enters.load(Ordering::SeqCst), 1);
         manager.stop().await;
     }
