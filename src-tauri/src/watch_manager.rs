@@ -24,7 +24,6 @@ pub struct WatchManagerOptions {
     pub reconnect_delays: Vec<Duration>,
     pub minimum_heartbeat_interval: Duration,
     pub rate_limit_pause: Duration,
-    pub heartbeat_pace: Duration,
 }
 
 impl Default for WatchManagerOptions {
@@ -42,7 +41,6 @@ impl Default for WatchManagerOptions {
             ],
             minimum_heartbeat_interval: Duration::from_secs(5),
             rate_limit_pause: Duration::from_secs(30),
-            heartbeat_pace: Duration::from_millis(30),
         }
     }
 }
@@ -64,9 +62,6 @@ impl WatchManagerOptions {
         if self.rate_limit_pause.is_zero() {
             self.rate_limit_pause = Duration::from_secs(30);
         }
-        if self.heartbeat_pace.is_zero() {
-            self.heartbeat_pace = Duration::from_millis(30);
-        }
         self
     }
 }
@@ -86,32 +81,6 @@ struct ManagerState {
     target: u16,
     sessions: BTreeMap<u16, SessionRuntime>,
     rate_limits: u64,
-}
-
-#[derive(Debug)]
-struct RequestPacer {
-    next: tokio::sync::Mutex<Instant>,
-    interval: Duration,
-}
-
-impl RequestPacer {
-    fn new(interval: Duration) -> Self {
-        Self {
-            next: tokio::sync::Mutex::new(Instant::now()),
-            interval,
-        }
-    }
-
-    async fn wait(&self, cancel: &CancellationToken) -> anyhow::Result<()> {
-        let ready_at = {
-            let mut next = self.next.lock().await;
-            let now = Instant::now();
-            let ready_at = (*next).max(now);
-            *next = ready_at + self.interval;
-            ready_at
-        };
-        wait_until(cancel, ready_at).await
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,7 +133,7 @@ pub struct WatchManager {
     cancel: CancellationToken,
     connect_semaphore: Arc<Semaphore>,
     gate: RateLimitGate,
-    heartbeat_pacer: RequestPacer,
+    epoch: Instant,
     room_entered: AtomicBool,
     enter_lock: tokio::sync::Mutex<()>,
     state: Mutex<ManagerState>,
@@ -185,7 +154,7 @@ impl WatchManager {
             cancel: parent.child_token(),
             connect_semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTS)),
             gate: RateLimitGate::new(),
-            heartbeat_pacer: RequestPacer::new(options.heartbeat_pace),
+            epoch: Instant::now(),
             room_entered: AtomicBool::new(false),
             enter_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(ManagerState::default()),
@@ -313,20 +282,30 @@ impl WatchManager {
                 }
             };
             self.set_established(id);
+            let slot = heartbeat_slot(id, self.options.max_sessions);
+            let mut not_before = Instant::now()
+                + trace
+                    .heartbeat_interval
+                    .max(self.options.minimum_heartbeat_interval);
             while !self.cancel.is_cancelled() {
                 let interval = trace
                     .heartbeat_interval
                     .max(self.options.minimum_heartbeat_interval);
-                if wait_duration(&self.cancel, interval).await.is_err() {
-                    return;
-                }
-                if self.heartbeat_pacer.wait(&self.cancel).await.is_err() {
+                let due = next_heartbeat_due(
+                    self.epoch,
+                    slot,
+                    self.options.max_sessions,
+                    interval,
+                    not_before.max(Instant::now()),
+                );
+                if wait_until(&self.cancel, due).await.is_err() {
                     return;
                 }
                 match self.api.trace_heartbeat(&self.cancel, &trace).await {
                     Ok(next) => {
                         trace = next;
                         attempt = 0;
+                        not_before = due + interval;
                         self.record_heartbeat(id);
                     }
                     Err(error) => {
@@ -451,6 +430,58 @@ fn random_duration(low: Duration, high: Duration) -> Duration {
     }
     let range = (high - low).as_nanos().min(u64::MAX as u128) as u64;
     low + Duration::from_nanos(rand::random::<u64>() % (range.saturating_add(1)))
+}
+
+/// Knuth multiplicative hash; coprime to typical session counts so 1..=N is a permutation of slots.
+const WEYL_MULTIPLIER: u64 = 2_654_435_761;
+
+fn heartbeat_slot(id: u16, n_slots: u16) -> u16 {
+    let n = u64::from(n_slots.max(1));
+    ((u64::from(id).wrapping_mul(WEYL_MULTIPLIER)) % n) as u16
+}
+
+fn heartbeat_phase(interval: Duration, slot: u16, n_slots: u16) -> Duration {
+    let n = u128::from(n_slots.max(1));
+    let slot = u128::from(slot) % n;
+    Duration::from_nanos((interval.as_nanos().saturating_mul(slot) / n) as u64)
+}
+
+fn scale_duration(interval: Duration, k: u128) -> Duration {
+    Duration::from_nanos(
+        interval
+            .as_nanos()
+            .saturating_mul(k)
+            .min(u128::from(u64::MAX)) as u64,
+    )
+}
+
+fn next_heartbeat_due(
+    epoch: Instant,
+    slot: u16,
+    n_slots: u16,
+    interval: Duration,
+    not_before: Instant,
+) -> Instant {
+    let interval = if interval.is_zero() {
+        Duration::from_nanos(1)
+    } else {
+        interval
+    };
+    let origin = epoch + heartbeat_phase(interval, slot, n_slots);
+    if not_before <= origin {
+        return origin;
+    }
+    let late = not_before.saturating_duration_since(origin);
+    let step = interval.as_nanos();
+    let k = {
+        let q = late.as_nanos() / step;
+        if late.as_nanos() % step == 0 {
+            q
+        } else {
+            q + 1
+        }
+    };
+    origin + scale_duration(interval, k)
 }
 
 async fn wait_until(cancel: &CancellationToken, deadline: Instant) -> anyhow::Result<()> {
@@ -607,7 +638,6 @@ mod tests {
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_secs(30),
             rate_limit_pause: Duration::from_millis(8),
-            heartbeat_pace: Duration::from_millis(1),
         }
     }
 
@@ -635,7 +665,58 @@ mod tests {
         let options = WatchManagerOptions::default();
         assert_eq!(options.launch_delay_min, Duration::ZERO);
         assert_eq!(options.launch_delay_max, Duration::ZERO);
-        assert_eq!(options.heartbeat_pace, Duration::from_millis(30));
+        assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(options.rate_limit_pause, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn heartbeat_slots_are_unique_on_the_ring() {
+        for n in [1u16, 2, 3, 10, 50, 500, MAX_SESSIONS] {
+            let mut slots: Vec<u16> = (1..=n).map(|id| heartbeat_slot(id, n)).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), usize::from(n), "n={n}");
+        }
+    }
+
+    #[test]
+    fn weyl_slots_spread_a_prefix_across_the_ring() {
+        let n_slots = 100u16;
+        let mut slots: Vec<u16> = (1..=10).map(|id| heartbeat_slot(id, n_slots)).collect();
+        slots.sort_unstable();
+        assert!(
+            slots[slots.len() - 1] - slots[0] > 40,
+            "prefix clustered: {slots:?}"
+        );
+    }
+
+    #[test]
+    fn next_heartbeat_due_stays_on_phase_grid() {
+        let epoch = Instant::now();
+        let interval = Duration::from_secs(60);
+        assert_eq!(next_heartbeat_due(epoch, 0, 4, interval, epoch), epoch);
+        assert_eq!(
+            next_heartbeat_due(epoch, 1, 4, interval, epoch),
+            epoch + Duration::from_secs(15)
+        );
+        assert_eq!(
+            next_heartbeat_due(epoch, 0, 4, interval, epoch + Duration::from_nanos(1)),
+            epoch + interval
+        );
+        assert_eq!(
+            next_heartbeat_due(epoch, 0, 4, interval, epoch + interval),
+            epoch + interval
+        );
+        assert_eq!(
+            next_heartbeat_due(
+                epoch,
+                0,
+                4,
+                interval,
+                epoch + interval + Duration::from_nanos(1)
+            ),
+            epoch + interval * 2
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -670,17 +751,6 @@ mod tests {
         assert!(gate.is_current(next));
     }
 
-    #[tokio::test]
-    async fn request_pacer_preserves_spacing() {
-        let pacer = RequestPacer::new(Duration::from_millis(5));
-        let cancel = CancellationToken::new();
-        let started = Instant::now();
-        pacer.wait(&cancel).await.unwrap();
-        pacer.wait(&cancel).await.unwrap();
-        pacer.wait(&cancel).await.unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(9));
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn established_heartbeats_continue_during_connect_rate_limit() {
         let cancel = CancellationToken::new();
@@ -694,7 +764,6 @@ mod tests {
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_millis(15),
             rate_limit_pause: Duration::from_millis(400),
-            heartbeat_pace: Duration::from_millis(1),
         };
         let manager = WatchManager::new(&cancel, api.clone(), room(), options);
         manager.scale_to(3).unwrap();
