@@ -34,6 +34,7 @@ const LIVE_ROOM_PAGE: &str = "https://live.bilibili.com/";
 const ROOM_ENTRY: &str = "https://api.live.bilibili.com/xlive/web-room/v1/index/roomEntryAction";
 const TRACE_ENTER: &str = "https://live-trace.bilibili.com/xlive/data-interface/v1/x25Kn/E";
 const TRACE_HEARTBEAT: &str = "https://live-trace.bilibili.com/xlive/data-interface/v1/x25Kn/X";
+const LIVE_TRACE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RewardInfo {
@@ -778,6 +779,9 @@ impl BiliClient {
             }
             if let Some(form) = &form {
                 request = request.form(form);
+            }
+            if endpoint.contains("live-trace.bilibili.com") {
+                request = request.timeout(LIVE_TRACE_TIMEOUT);
             }
             let response = tokio::select! {
                 _ = cancel.cancelled() => bail!("操作已取消"),
