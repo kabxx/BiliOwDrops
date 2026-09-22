@@ -8,8 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::domain::{BiliApi, CheckpointState, TaskCheckpoint, TaskProgress};
 
-pub const MINIMUM_CHECKPOINT_STABLE_POLLS: u32 = 5;
-pub const CONFIRMATION_POLLS: u32 = 2;
+pub const COMPLETION_POLLS: u32 = 5;
 pub const CLAIM_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 pub const CLAIM_SPACING: Duration = Duration::from_secs(1);
 
@@ -17,7 +16,6 @@ pub const CLAIM_SPACING: Duration = Duration::from_secs(1);
 pub struct RewardTracker {
     expected_tasks: HashSet<String>,
     known_checkpoints: HashMap<String, HashSet<String>>,
-    stable_polls: HashMap<String, u32>,
     last_attempt: HashMap<String, Instant>,
     claim_submitted: HashSet<String>,
     consecutive_confirmed: u32,
@@ -90,26 +88,10 @@ impl RewardTracker {
                 .map(|point| point.id.clone())
                 .collect::<HashSet<_>>();
             let known = self.known_checkpoints.entry(task.id.clone()).or_default();
-            let mut changed = false;
             for id in &current_ids {
-                if known.insert(id.clone()) {
-                    changed = true;
-                }
+                known.insert(id.clone());
             }
-            for id in known.iter() {
-                if !current_ids.contains(id) {
-                    changed = true;
-                    all_confirmed = false;
-                }
-            }
-            let stable = self.stable_polls.entry(task.id.clone()).or_default();
-            if changed {
-                *stable = 1;
-                all_confirmed = false;
-            } else {
-                *stable = stable.saturating_add(1);
-            }
-            if *stable < MINIMUM_CHECKPOINT_STABLE_POLLS {
+            if known.iter().any(|id| !current_ids.contains(id)) {
                 all_confirmed = false;
             }
             if !checkpoints_cover_task_limit(task, &points) {
@@ -133,7 +115,7 @@ impl RewardTracker {
         } else {
             self.consecutive_confirmed = 0;
         }
-        Ok(self.consecutive_confirmed >= CONFIRMATION_POLLS)
+        Ok(self.consecutive_confirmed >= COMPLETION_POLLS)
     }
 
     async fn claim_if_due<A: BiliApi + ?Sized>(
@@ -332,14 +314,14 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn stable_full_set_requires_five_then_two_polls() {
+    async fn consecutive_five_all_claimed_completes() {
         let api = Arc::new(ClaimApi {
             calls: AtomicUsize::new(0),
         });
         let cancel = CancellationToken::new();
         let mut tracker = RewardTracker::new(["parent".into()]);
         let full = task(10.0, 10.0, vec![point("a", 10.0, 3)]);
-        for _ in 0..5 {
+        for _ in 0..4 {
             assert!(!tracker
                 .process(&cancel, api.as_ref(), std::slice::from_ref(&full))
                 .await
