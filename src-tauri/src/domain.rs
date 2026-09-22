@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_ROOM_ID: &str = "23612045";
 pub const MIN_SESSIONS: u16 = 10;
 pub const DEFAULT_SESSIONS: u16 = 500;
-pub const MAX_SESSIONS: u16 = 10000;
+pub const MAX_SESSIONS: u16 = 5000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn configuration_rejects_out_of_range_sessions() {
-        for sessions in [0, 9, 10001] {
+        for sessions in [0, 9, 5001] {
             assert!(RunConfiguration {
                 room_id: DEFAULT_ROOM_ID.into(),
                 sessions,

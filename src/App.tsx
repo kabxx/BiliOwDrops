@@ -53,8 +53,8 @@ import { cn } from "@/lib/utils"
 import { toast } from "sonner"
 
 const MIN_SESSIONS = 10
-const MAX_SESSIONS = 10000
-const SESSION_PRESETS = [10, 100, 500, 2000, 10000]
+const MAX_SESSIONS = 5000
+const SESSION_PRESETS = [10, 100, 500, 2000, 5000]
 const SESSION_SCALE_POWER = 1.5
 
 function sessionScale(value: number) {
