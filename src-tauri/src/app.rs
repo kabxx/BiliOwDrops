@@ -499,6 +499,7 @@ impl AppController {
                                     room.clone(),
                                     options.clone(),
                                 );
+                                active_manager.enter_room().await?;
                                 active_manager.scale_to(sessions)?;
                                 manager = Some(active_manager);
                                 self.update(|snapshot| {

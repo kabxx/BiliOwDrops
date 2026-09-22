@@ -1,9 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -187,8 +184,6 @@ pub struct WatchManager {
     cancel: CancellationToken,
     enter: EnterAimd,
     epoch: Instant,
-    room_entered: AtomicBool,
-    enter_lock: tokio::sync::Mutex<()>,
     state: Mutex<ManagerState>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -207,12 +202,14 @@ impl WatchManager {
             cancel: parent.child_token(),
             enter: EnterAimd::new(&options),
             epoch: Instant::now(),
-            room_entered: AtomicBool::new(false),
-            enter_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(ManagerState::default()),
             tasks: Mutex::new(Vec::new()),
             options,
         })
+    }
+
+    pub async fn enter_room(&self) -> anyhow::Result<()> {
+        self.api.enter_room(&self.cancel, &self.room).await
     }
 
     pub fn scale_to(self: &Arc<Self>, target: u16) -> anyhow::Result<()> {
@@ -374,7 +371,6 @@ impl WatchManager {
     }
 
     async fn establish(&self, page_uuid: &str) -> anyhow::Result<TraceState> {
-        self.ensure_room_entered().await?;
         self.enter.wait_slot(&self.cancel).await?;
         let result = self
             .api
@@ -392,21 +388,6 @@ impl WatchManager {
         result
     }
 
-    async fn ensure_room_entered(&self) -> anyhow::Result<()> {
-        if self.room_entered.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _guard = tokio::select! {
-            guard = self.enter_lock.lock() => guard,
-            _ = self.cancel.cancelled() => return Err(anyhow!("操作已取消")),
-        };
-        if self.room_entered.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.api.enter_room(&self.cancel, &self.room).await?;
-        self.room_entered.store(true, Ordering::Release);
-        Ok(())
-    }
 
     fn set_established(&self, id: u16) {
         if let Some(session) = self.state.lock().sessions.get_mut(&id) {
@@ -674,6 +655,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let api = Arc::new(MockApi::new(0));
         let manager = WatchManager::new(&cancel, api.clone(), room(), fast_options(50));
+        manager.enter_room().await.unwrap();
         manager.scale_to(50).unwrap();
         assert_eq!(manager.stats().registered, 50);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -777,6 +759,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let api = Arc::new(MockApi::new(2));
         let manager = WatchManager::new(&cancel, api.clone(), room(), fast_options(4));
+        manager.enter_room().await.unwrap();
         manager.scale_to(4).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while manager.stats().established < 4 {
@@ -808,6 +791,7 @@ mod tests {
             ..WatchManagerOptions::default()
         };
         let manager = WatchManager::new(&cancel, api.clone(), room(), options);
+        manager.enter_room().await.unwrap();
         manager.scale_to(3).unwrap();
         tokio::time::timeout(Duration::from_millis(200), async {
             while manager.stats().heartbeats < 3 {
