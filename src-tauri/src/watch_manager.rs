@@ -9,12 +9,17 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use parking_lot::Mutex;
-use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
+use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{BiliApi, LiveRoomInfo, SessionStats, TraceState, MAX_SESSIONS};
 
-const MAX_IN_FLIGHT_CONNECTS: usize = 2;
+const ENTER_RATE_INITIAL: f64 = 10.0;
+const ENTER_RATE_MIN: f64 = 1.0;
+const ENTER_RATE_MAX: f64 = 100.0;
+const ENTER_RATE_ADD_PER_SEC: f64 = 5.0;
+const ENTER_RATE_DECAY: f64 = 0.5;
+const ENTER_DROP_COOLDOWN: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct WatchManagerOptions {
@@ -23,6 +28,9 @@ pub struct WatchManagerOptions {
     pub launch_delay_max: Duration,
     pub reconnect_delays: Vec<Duration>,
     pub minimum_heartbeat_interval: Duration,
+    pub enter_rate_initial: f64,
+    pub enter_rate_min: f64,
+    pub enter_rate_max: f64,
 }
 
 impl Default for WatchManagerOptions {
@@ -39,6 +47,9 @@ impl Default for WatchManagerOptions {
                 Duration::from_secs(30),
             ],
             minimum_heartbeat_interval: Duration::from_secs(5),
+            enter_rate_initial: ENTER_RATE_INITIAL,
+            enter_rate_min: ENTER_RATE_MIN,
+            enter_rate_max: ENTER_RATE_MAX,
         }
     }
 }
@@ -57,6 +68,18 @@ impl WatchManagerOptions {
         if self.minimum_heartbeat_interval.is_zero() {
             self.minimum_heartbeat_interval = Duration::from_secs(5);
         }
+        if self.enter_rate_min <= 0.0 {
+            self.enter_rate_min = ENTER_RATE_MIN;
+        }
+        if self.enter_rate_max < self.enter_rate_min {
+            self.enter_rate_max = self.enter_rate_min.max(ENTER_RATE_MAX);
+        }
+        if self.enter_rate_initial <= 0.0 {
+            self.enter_rate_initial = ENTER_RATE_INITIAL;
+        }
+        self.enter_rate_initial = self
+            .enter_rate_initial
+            .clamp(self.enter_rate_min, self.enter_rate_max);
         self
     }
 }
@@ -77,12 +100,92 @@ struct ManagerState {
     sessions: BTreeMap<u16, SessionRuntime>,
 }
 
+struct EnterAimd {
+    state: Mutex<EnterAimdState>,
+    min: f64,
+    max: f64,
+}
+
+struct EnterAimdState {
+    rate: f64,
+    next: Instant,
+    last_drop: Instant,
+}
+
+impl EnterAimd {
+    fn new(options: &WatchManagerOptions) -> Self {
+        let now = Instant::now();
+        Self {
+            state: Mutex::new(EnterAimdState {
+                rate: options.enter_rate_initial,
+                next: now,
+                last_drop: now - ENTER_DROP_COOLDOWN,
+            }),
+            min: options.enter_rate_min,
+            max: options.enter_rate_max,
+        }
+    }
+
+    async fn wait_slot(&self, cancel: &CancellationToken) -> anyhow::Result<()> {
+        loop {
+            let deadline = {
+                let mut state = self.state.lock();
+                let now = Instant::now();
+                if now >= state.next {
+                    state.next = now + enter_interval(state.rate);
+                    return Ok(());
+                }
+                state.next
+            };
+            wait_until(cancel, deadline).await?;
+        }
+    }
+
+    fn on_success(&self) {
+        let mut state = self.state.lock();
+        let rate = state.rate.max(self.min);
+        state.rate = (rate + ENTER_RATE_ADD_PER_SEC / rate).min(self.max);
+    }
+
+    fn on_rate_limit(&self) {
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        if now.saturating_duration_since(state.last_drop) < ENTER_DROP_COOLDOWN {
+            return;
+        }
+        state.last_drop = now;
+        state.rate = (state.rate * ENTER_RATE_DECAY).max(self.min);
+        let earliest = now + enter_interval(state.rate);
+        if state.next < earliest {
+            state.next = earliest;
+        }
+    }
+
+    #[cfg(test)]
+    fn rate(&self) -> f64 {
+        self.state.lock().rate
+    }
+}
+
+fn enter_interval(rate: f64) -> Duration {
+    Duration::from_secs_f64(1.0 / rate.max(0.001))
+}
+
+fn is_rate_limit_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("-702")
+        || message.contains("-509")
+        || message.contains("http 429")
+        || message.contains("频率")
+        || message.contains("频繁")
+}
+
 pub struct WatchManager {
     api: Arc<dyn BiliApi>,
     room: LiveRoomInfo,
     options: WatchManagerOptions,
     cancel: CancellationToken,
-    connect_semaphore: Arc<Semaphore>,
+    enter: EnterAimd,
     epoch: Instant,
     room_entered: AtomicBool,
     enter_lock: tokio::sync::Mutex<()>,
@@ -102,7 +205,7 @@ impl WatchManager {
             api,
             room,
             cancel: parent.child_token(),
-            connect_semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTS)),
+            enter: EnterAimd::new(&options),
             epoch: Instant::now(),
             room_entered: AtomicBool::new(false),
             enter_lock: tokio::sync::Mutex::new(()),
@@ -272,17 +375,20 @@ impl WatchManager {
 
     async fn establish(&self, page_uuid: &str) -> anyhow::Result<TraceState> {
         self.ensure_room_entered().await?;
-        let permit = tokio::select! {
-            permit = Arc::clone(&self.connect_semaphore).acquire_owned() => {
-                permit.map_err(|_| anyhow!("建连调度器已关闭"))?
-            }
-            _ = self.cancel.cancelled() => return Err(anyhow!("操作已取消")),
-        };
+        self.enter.wait_slot(&self.cancel).await?;
         let result = self
             .api
             .trace_enter(&self.cancel, &self.room, page_uuid)
             .await;
-        drop(permit);
+        if result.is_ok() {
+            self.enter.on_success();
+        } else if result
+            .as_ref()
+            .err()
+            .is_some_and(is_rate_limit_error)
+        {
+            self.enter.on_rate_limit();
+        }
         result
     }
 
@@ -548,7 +654,19 @@ mod tests {
             launch_delay_max: Duration::ZERO,
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_secs(30),
+            enter_rate_initial: 10_000.0,
+            enter_rate_min: 1.0,
+            enter_rate_max: 10_000.0,
         }
+    }
+
+    fn test_enter_limiter(initial: f64) -> EnterAimd {
+        EnterAimd::new(&WatchManagerOptions {
+            enter_rate_initial: initial,
+            enter_rate_min: ENTER_RATE_MIN,
+            enter_rate_max: ENTER_RATE_MAX,
+            ..WatchManagerOptions::default()
+        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -576,6 +694,32 @@ mod tests {
         assert_eq!(options.launch_delay_min, Duration::ZERO);
         assert_eq!(options.launch_delay_max, Duration::ZERO);
         assert_eq!(options.minimum_heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(options.enter_rate_initial, 10.0);
+        assert_eq!(options.enter_rate_min, 1.0);
+        assert_eq!(options.enter_rate_max, 100.0);
+    }
+
+    #[test]
+    fn enter_aimd_grows_on_success_and_halves_once_per_second() {
+        let limiter = test_enter_limiter(40.0);
+        limiter.on_success();
+        assert!(limiter.rate() > 40.0);
+        limiter.on_rate_limit();
+        let halved = limiter.rate();
+        assert!((halved - 20.0).abs() < 1.0);
+        limiter.on_rate_limit();
+        assert_eq!(limiter.rate(), halved);
+    }
+
+    #[tokio::test]
+    async fn enter_aimd_paces_at_current_rate() {
+        let limiter = test_enter_limiter(10.0);
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        limiter.wait_slot(&cancel).await.unwrap();
+        limiter.wait_slot(&cancel).await.unwrap();
+        limiter.wait_slot(&cancel).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(180));
     }
 
     #[test]
@@ -661,6 +805,7 @@ mod tests {
             launch_delay_max: Duration::ZERO,
             reconnect_delays: vec![Duration::from_millis(1)],
             minimum_heartbeat_interval: Duration::from_millis(15),
+            ..WatchManagerOptions::default()
         };
         let manager = WatchManager::new(&cancel, api.clone(), room(), options);
         manager.scale_to(3).unwrap();
