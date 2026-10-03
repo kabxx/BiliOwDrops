@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   GiftIcon,
   LoaderCircleIcon,
   LogOutIcon,
@@ -596,6 +598,126 @@ function CheckErrorDialog({
   )
 }
 
+function DropTabs({
+  progresses,
+  activeTaskKey,
+  onSelect,
+}: {
+  progresses: DropProgress[]
+  activeTaskKey?: string
+  onSelect: (key: string) => void
+}) {
+  const shellRef = useRef<HTMLDivElement>(null)
+  const scrollerRef = useRef<HTMLDivElement>(null)
+  const [overflow, setOverflow] = useState({ any: false, left: false, right: false })
+
+  useEffect(() => {
+    const shell = shellRef.current
+    const scroller = scrollerRef.current
+    if (!shell || !scroller) return
+
+    const syncOverflow = () => {
+      const items = scroller.children
+      const first = items.item(0)
+      const last = items.item(items.length - 1)
+      const needed =
+        first instanceof HTMLElement && last instanceof HTMLElement
+          ? last.offsetLeft + last.offsetWidth - first.offsetLeft
+          : 0
+      const any = needed > shell.clientWidth + 1
+      const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+      setOverflow({
+        any,
+        left: any && scroller.scrollLeft > 1,
+        right: any && scroller.scrollLeft < max - 1,
+      })
+    }
+
+    syncOverflow()
+    const observer = new ResizeObserver(syncOverflow)
+    observer.observe(shell)
+    observer.observe(scroller)
+    scroller.addEventListener("scroll", syncOverflow, { passive: true })
+    const onWheel = (event: WheelEvent) => {
+      if (scroller.scrollWidth <= scroller.clientWidth) return
+      const delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX
+      if (!delta) return
+      event.preventDefault()
+      scroller.scrollLeft += delta
+      syncOverflow()
+    }
+    scroller.addEventListener("wheel", onWheel, { passive: false })
+    return () => {
+      observer.disconnect()
+      scroller.removeEventListener("scroll", syncOverflow)
+      scroller.removeEventListener("wheel", onWheel)
+    }
+  }, [progresses])
+
+  useEffect(() => {
+    const active = scrollerRef.current?.querySelector(".drop-tab.is-active")
+    if (active instanceof HTMLElement) {
+      active.scrollIntoView({ inline: "nearest", block: "nearest", behavior: "smooth" })
+    }
+  }, [activeTaskKey])
+
+  function scrollByDir(dir: -1 | 1) {
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    scroller.scrollBy({ left: dir * Math.max(180, scroller.clientWidth * 0.55), behavior: "smooth" })
+  }
+
+  return (
+    <div
+      ref={shellRef}
+      className={cn(
+        "drop-tabs-shell",
+        overflow.any && "is-overflow",
+        overflow.left && "has-left",
+        overflow.right && "has-right",
+      )}
+    >
+      <button
+        type="button"
+        className="drop-tabs-nav is-prev"
+        aria-label="上一组掉宝"
+        disabled={!overflow.left}
+        onClick={() => scrollByDir(-1)}
+      >
+        <ChevronLeftIcon />
+      </button>
+      <div className="drop-tabs" ref={scrollerRef} role="tablist" aria-label="今天的掉宝">
+        {progresses.map((progress) => {
+          const selected = progress.taskKey === activeTaskKey
+          return (
+            <button
+              key={progress.taskKey}
+              type="button"
+              className={cn("drop-tab", selected && "is-active")}
+              role="tab"
+              aria-selected={selected}
+              tabIndex={selected ? 0 : -1}
+              onClick={() => onSelect(progress.taskKey)}
+            >
+              <span>{progress.name}</span>
+            </button>
+          )
+        })}
+      </div>
+      <button
+        type="button"
+        className="drop-tabs-nav is-next"
+        aria-label="下一组掉宝"
+        disabled={!overflow.right}
+        onClick={() => scrollByDir(1)}
+      >
+        <ChevronRightIcon />
+      </button>
+    </div>
+  )
+}
+
+
 function RunView({
   snapshot,
   onStop,
@@ -670,24 +792,11 @@ function RunView({
         ) : (
           <div className={cn("progress-stage", showTabs && "has-tabs")}>
             {showTabs && (
-              <div className="drop-tabs" role="tablist" aria-label="今天的掉宝">
-                {progresses.map((progress) => {
-                  const selected = progress.taskKey === activeProgress?.taskKey
-                  return (
-                    <button
-                      key={progress.taskKey}
-                      type="button"
-                      className={cn("drop-tab", selected && "is-active")}
-                      role="tab"
-                      aria-selected={selected}
-                      tabIndex={selected ? 0 : -1}
-                      onClick={() => setActiveTaskKey(progress.taskKey)}
-                    >
-                      <span>{progress.name}</span>
-                    </button>
-                  )
-                })}
-              </div>
+              <DropTabs
+                progresses={progresses}
+                activeTaskKey={activeProgress?.taskKey}
+                onSelect={setActiveTaskKey}
+              />
             )}
             {activeProgress && <DropProgressRow progress={activeProgress} showName={false} />}
           </div>

@@ -874,19 +874,86 @@
   flex-basis: 210px;
 }
 
-.drop-tabs {
+
+.drop-tabs-shell {
   position: absolute;
   top: -4px;
   right: 0;
   left: 0;
   display: flex;
-  max-width: 100%;
+  align-items: stretch;
+  gap: 10px;
+  margin: 0 0 18px;
+}
+
+.drop-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1;
   align-items: stretch;
   gap: 28px;
-  margin: 0 0 18px;
   overflow-x: auto;
-  scrollbar-width: thin;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
+
+.drop-tabs::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.drop-tabs-shell.has-left .drop-tabs {
+  mask-image: linear-gradient(to right, transparent, #000 20px, #000 100%);
+}
+
+.drop-tabs-shell.has-right .drop-tabs {
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 20px), transparent);
+}
+
+.drop-tabs-shell.has-left.has-right .drop-tabs {
+  mask-image: linear-gradient(to right, transparent, #000 20px, #000 calc(100% - 20px), transparent);
+}
+
+.drop-tabs-nav {
+  display: none;
+  flex: 0 0 22px;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.drop-tabs-shell.is-overflow .drop-tabs-nav {
+  display: inline-flex;
+}
+
+.drop-tabs-nav:hover {
+  color: var(--text-1);
+}
+
+.drop-tabs-nav:disabled {
+  color: #3b4047;
+  cursor: default;
+}
+
+.drop-tabs-nav:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+.drop-tabs-nav svg {
+  width: 14px;
+  height: 14px;
+}
+
 
 .drop-tab {
   display: inline-flex;
