@@ -1035,8 +1035,7 @@ fn extract_task_scope_from_page(html: &str) -> anyhow::Result<(Vec<String>, Task
     };
     let assignment_start =
         eva_assignment_start(html, marker, marker_start).context("直播间掉宝页面数据不完整")?;
-    let start = assignment_start;
-    let payload = html[start..].trim_start();
+    let payload = html[assignment_start..].trim_start();
     if payload.starts_with("null") || payload.starts_with("undefined") || payload.starts_with("[]")
     {
         return Ok((Vec::new(), HashMap::new()));
@@ -1046,31 +1045,28 @@ fn extract_task_scope_from_page(html: &str) -> anyhow::Result<(Vec<String>, Task
     if root.is_null() || root.is_array() {
         return Ok((Vec::new(), HashMap::new()));
     }
-    let Some(active_panel_id) = find_activated_panel_id(&root) else {
-        // The page payload is valid, but there is no active panel for today.
-        // This is a confirmed empty state, not a transient request failure.
+    if let Some(active_panel_id) = find_activated_panel_id(&root) {
+        if let Some(active_panel) = find_active_panel(&root, active_panel_id) {
+            return Ok(task_scope_from_node(active_panel));
+        }
+        // Old tab layout with a panel id but no matching panel: still empty.
         return Ok((Vec::new(), HashMap::new()));
-    };
-    let Some(active_panel) = find_active_panel(&root, active_panel_id) else {
-        // Some rooms publish a valid activity payload without a rendered tab
-        // panel when today's drop list is empty.
-        return Ok((Vec::new(), HashMap::new()));
-    };
+    }
+    // 2026-10 OWCS layerTree payload has tasklist but no activatedTabPanelId.
+    Ok(task_scope_from_node(&root))
+}
 
+fn task_scope_from_node(node: &Value) -> (Vec<String>, TaskCheckpointMap) {
     let mut values = Vec::new();
     let mut checkpoint_ids_by_task = HashMap::new();
-    let has_task_list =
-        collect_task_list_data(active_panel, &mut values, &mut checkpoint_ids_by_task);
-    if !has_task_list {
-        // The active panel is present, but a no-drop panel has no tasklist at all.
-        // Missing marker/panel still errors above and remains in the retry state.
-        return Ok((Vec::new(), HashMap::new()));
+    if !collect_task_list_data(node, &mut values, &mut checkpoint_ids_by_task) {
+        return (Vec::new(), HashMap::new());
     }
     let task_ids = normalized_task_ids(&values);
     for task_id in &task_ids {
         checkpoint_ids_by_task.entry(task_id.clone()).or_default();
     }
-    Ok((task_ids, checkpoint_ids_by_task))
+    (task_ids, checkpoint_ids_by_task)
 }
 
 fn eva_assignment_start(html: &str, marker: &str, first_marker: usize) -> Option<usize> {
@@ -1513,6 +1509,64 @@ mod tests {
             vec!["second", "first"]
         );
     }
+
+    fn eva_html(payload: Value) -> String {
+        format!("window.__BILIACT_EVAPAGEDATA__ = {payload}")
+    }
+
+    #[test]
+    fn layer_tree_tasklist_is_discovered_without_tab_panel() {
+        let html = eva_html(json!({
+            "activatedLayerId": null,
+            "layerTree": [{
+                "slots": [{
+                    "children": [{
+                        "props": {
+                            "tasklist": [
+                                {
+                                    "taskId": "6ERAcwloghvp4i00",
+                                    "taskName": "观看直播60分钟",
+                                    "checkpoints": [{
+                                        "awardsid": "5ERAnwloghve5k00",
+                                        "ztasksid": "6ERAcwloghvp4i00"
+                                    }]
+                                },
+                                {
+                                    "taskId": "6ERAcwloghvolb00",
+                                    "taskName": "观看直播120分钟",
+                                    "checkpoints": [{
+                                        "awardsid": "5ERAnwloghvw4400",
+                                        "ztasksid": "6ERAcwloghvolb00"
+                                    }]
+                                }
+                            ]
+                        }
+                    }]
+                }]
+            }]
+        }));
+        let (ids, checkpoints) = extract_task_scope_from_page(&html).unwrap();
+        assert_eq!(
+            ids,
+            vec!["6ERAcwloghvp4i00", "6ERAcwloghvolb00"]
+        );
+        assert!(checkpoints["6ERAcwloghvp4i00"].contains("5ERAnwloghve5k00"));
+        assert!(checkpoints["6ERAcwloghvolb00"].contains("5ERAnwloghvw4400"));
+    }
+
+    #[test]
+    fn tab_panel_scope_still_ignores_other_tabs() {
+        let html = eva_html(json!({
+            "activatedTabPanelId": "today",
+            "children": [
+                {"id": "today", "props": {"tasklist": [{"taskId": "today-task"}]}},
+                {"id": "yesterday", "props": {"tasklist": [{"taskId": "old-task"}]}}
+            ]
+        }));
+        let (ids, _) = extract_task_scope_from_page(&html).unwrap();
+        assert_eq!(ids, vec!["today-task"]);
+    }
+
 
     #[test]
     fn x25kn_hmac_chain_matches_go_vector() {
